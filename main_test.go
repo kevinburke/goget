@@ -9,45 +9,112 @@ func TestGetRepositoryURL(t *testing.T) {
 	tests := []struct {
 		name       string
 		importPath string
+		useHTTPS   bool
 		expected   string
 	}{
 		{
-			name:       "golang.org/x package",
+			name:       "golang.org/x package (SSH)",
 			importPath: "golang.org/x/sync",
+			useHTTPS:   false,
 			expected:   "https://go.googlesource.com/sync",
 		},
 		{
-			name:       "golang.org/x package with subpackage",
+			name:       "golang.org/x package (HTTPS)",
+			importPath: "golang.org/x/sync",
+			useHTTPS:   true,
+			expected:   "https://go.googlesource.com/sync",
+		},
+		{
+			name:       "golang.org/x package with subpackage (SSH)",
 			importPath: "golang.org/x/crypto/ssh",
+			useHTTPS:   false,
 			expected:   "https://go.googlesource.com/crypto",
 		},
 		{
-			name:       "github package",
+			name:       "golang.org/x package with subpackage (HTTPS)",
+			importPath: "golang.org/x/crypto/ssh",
+			useHTTPS:   true,
+			expected:   "https://go.googlesource.com/crypto",
+		},
+		{
+			name:       "github package (SSH)",
 			importPath: "github.com/user/repo",
+			useHTTPS:   false,
 			expected:   "git@github.com:user/repo.git",
 		},
 		{
-			name:       "github package with subpackage",
+			name:       "github package (HTTPS)",
+			importPath: "github.com/user/repo",
+			useHTTPS:   true,
+			expected:   "https://github.com/user/repo.git",
+		},
+		{
+			name:       "github package with subpackage (SSH)",
 			importPath: "github.com/user/repo/subpkg",
+			useHTTPS:   false,
 			expected:   "git@github.com:user/repo.git",
 		},
 		{
-			name:       "other domain with two parts (full path)",
+			name:       "github package with subpackage (HTTPS)",
+			importPath: "github.com/user/repo/subpkg",
+			useHTTPS:   true,
+			expected:   "https://github.com/user/repo.git",
+		},
+		{
+			name:       "other domain with two parts (SSH)",
 			importPath: "example.com/foo/bar",
+			useHTTPS:   false,
 			expected:   "git@example.com:foo/bar.git",
 		},
 		{
-			name:       "github with deep subpackage",
+			name:       "other domain with two parts (HTTPS)",
+			importPath: "example.com/foo/bar",
+			useHTTPS:   true,
+			expected:   "https://example.com/foo/bar.git",
+		},
+		{
+			name:       "github with deep subpackage (SSH)",
 			importPath: "github.com/user/repo/pkg/subpkg",
+			useHTTPS:   false,
 			expected:   "git@github.com:user/repo.git",
+		},
+		{
+			name:       "github with deep subpackage (HTTPS)",
+			importPath: "github.com/user/repo/pkg/subpkg",
+			useHTTPS:   true,
+			expected:   "https://github.com/user/repo.git",
+		},
+		{
+			name:       "gitlab package (SSH)",
+			importPath: "gitlab.com/user/repo",
+			useHTTPS:   false,
+			expected:   "git@gitlab.com:user/repo.git",
+		},
+		{
+			name:       "gitlab package (HTTPS)",
+			importPath: "gitlab.com/user/repo",
+			useHTTPS:   true,
+			expected:   "https://gitlab.com/user/repo.git",
+		},
+		{
+			name:       "bitbucket package (SSH)",
+			importPath: "bitbucket.org/user/repo",
+			useHTTPS:   false,
+			expected:   "git@bitbucket.org:user/repo.git",
+		},
+		{
+			name:       "bitbucket package (HTTPS)",
+			importPath: "bitbucket.org/user/repo",
+			useHTTPS:   true,
+			expected:   "https://bitbucket.org/user/repo.git",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getRepositoryURL(tt.importPath)
+			result := getRepositoryURL(tt.importPath, tt.useHTTPS)
 			if result != tt.expected {
-				t.Errorf("getRepositoryURL(%q) = %q, want %q", tt.importPath, result, tt.expected)
+				t.Errorf("getRepositoryURL(%q, %v) = %q, want %q", tt.importPath, tt.useHTTPS, result, tt.expected)
 			}
 		})
 	}
@@ -152,43 +219,78 @@ func TestBuildGitCommand(t *testing.T) {
 	tests := []struct {
 		name         string
 		config       *Config
+		useHTTPS     bool
 		expectedURL  string
 		expectedPath string
 		expectError  bool
 	}{
 		{
-			name: "absolute path",
+			name: "absolute path (SSH)",
 			config: &Config{
 				GOPATH:     "/home/user/go",
 				ImportPath: "github.com/user/repo",
 			},
+			useHTTPS:     false,
 			expectedURL:  "git@github.com:user/repo.git",
 			expectedPath: "/home/user/go/src/github.com/user/repo",
 		},
 		{
-			name: "golang.org/x package",
+			name: "absolute path (HTTPS)",
+			config: &Config{
+				GOPATH:     "/home/user/go",
+				ImportPath: "github.com/user/repo",
+			},
+			useHTTPS:     true,
+			expectedURL:  "https://github.com/user/repo.git",
+			expectedPath: "/home/user/go/src/github.com/user/repo",
+		},
+		{
+			name: "golang.org/x package (SSH)",
 			config: &Config{
 				GOPATH:     "/home/user/go",
 				ImportPath: "golang.org/x/sync",
 			},
+			useHTTPS:     false,
 			expectedURL:  "https://go.googlesource.com/sync",
 			expectedPath: "/home/user/go/src/golang.org/x/sync",
 		},
 		{
-			name: "relative path",
+			name: "golang.org/x package (HTTPS)",
+			config: &Config{
+				GOPATH:     "/home/user/go",
+				ImportPath: "golang.org/x/sync",
+			},
+			useHTTPS:     true,
+			expectedURL:  "https://go.googlesource.com/sync",
+			expectedPath: "/home/user/go/src/golang.org/x/sync",
+		},
+		{
+			name: "relative path (SSH)",
 			config: &Config{
 				GOPATH:     "/home/user/go",
 				WorkingDir: "/home/user/go/src/github.com/user",
 				ImportPath: "./repo",
 			},
+			useHTTPS:     false,
 			expectedURL:  "git@github.com:user/repo.git",
+			expectedPath: "./repo",
+		},
+		{
+			name: "relative path (HTTPS)",
+			config: &Config{
+				GOPATH:     "/home/user/go",
+				WorkingDir: "/home/user/go/src/github.com/user",
+				ImportPath: "./repo",
+			},
+			useHTTPS:     true,
+			expectedURL:  "https://github.com/user/repo.git",
 			expectedPath: "./repo",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd, err := buildGitCommand(tt.config)
+			cmd, err := buildGitCommand(tt.config, tt.useHTTPS)
 
 			if tt.expectError {
 				if err == nil {

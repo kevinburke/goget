@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+var httpsFlag = flag.Bool("https", false, "use HTTPS for git clones instead of SSH")
+
 // Config holds the configuration for a goget operation
 type Config struct {
 	GOPATH      string
@@ -27,7 +29,7 @@ type GitCommand struct {
 }
 
 // getRepositoryURL handles special cases and converts import paths to git URLs
-func getRepositoryURL(importPath string) string {
+func getRepositoryURL(importPath string, useHTTPS bool) string {
 	// Handle golang.org/x/* packages
 	if strings.HasPrefix(importPath, "golang.org/x/") {
 		repo := strings.TrimPrefix(importPath, "golang.org/x/")
@@ -44,7 +46,7 @@ func getRepositoryURL(importPath string) string {
 	//     // Handle uber's vanity URLs
 	// }
 
-	// Default behavior: construct SSH URL from import path
+	// Default behavior: construct SSH or HTTPS URL from import path
 	parts := strings.Split(importPath, "/")
 	if len(parts) == 0 {
 		return ""
@@ -57,15 +59,24 @@ func getRepositoryURL(importPath string) string {
 	if isCommonGitHost(domain) && len(parts) >= 3 {
 		// Take only domain/user/repo for the git URL
 		repo := strings.Join(parts[1:3], "/")
+		if useHTTPS {
+			return fmt.Sprintf("https://%s/%s.git", domain, repo)
+		}
 		return fmt.Sprintf("git@%s:%s.git", domain, repo)
 	}
 
 	// For other domains, use the full path (minus domain)
 	if len(parts) > 1 {
 		repo := strings.Join(parts[1:], "/")
+		if useHTTPS {
+			return fmt.Sprintf("https://%s/%s.git", domain, repo)
+		}
 		return fmt.Sprintf("git@%s:%s.git", domain, repo)
 	}
 
+	if useHTTPS {
+		return fmt.Sprintf("https://%s.git", domain)
+	}
 	return fmt.Sprintf("git@%s.git", domain)
 }
 
@@ -148,7 +159,7 @@ func resolveConfig(arg, gopath, workingDir string) (*Config, error) {
 }
 
 // buildGitCommand creates the git command from the config
-func buildGitCommand(config *Config) (*GitCommand, error) {
+func buildGitCommand(config *Config, useHTTPS bool) (*GitCommand, error) {
 	var gitURL string
 	var checkoutPath string
 
@@ -174,10 +185,10 @@ func buildGitCommand(config *Config) (*GitCommand, error) {
 		pkgstart := strings.TrimPrefix(rel, "src/")
 		fullpkg := filepath.Join(pkgstart, config.ImportPath)
 		checkoutPath = config.ImportPath
-		gitURL = getRepositoryURL(fullpkg)
+		gitURL = getRepositoryURL(fullpkg, useHTTPS)
 	} else {
 		checkoutPath = filepath.Join(config.GOPATH, "src", config.ImportPath)
-		gitURL = getRepositoryURL(config.ImportPath)
+		gitURL = getRepositoryURL(config.ImportPath, useHTTPS)
 	}
 
 	if gitURL == "" {
@@ -200,7 +211,7 @@ func executeGitCommand(ctx context.Context, cmd *GitCommand) error {
 }
 
 // runGoGet is the main logic, extracted from main() for testability
-func runGoGet(ctx context.Context, arg, gopath, workingDir string) error {
+func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool) error {
 	config, err := resolveConfig(arg, gopath, workingDir)
 	if err != nil {
 		return err
@@ -214,7 +225,7 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string) error {
 		log.Printf("WARN: multiple paths in GOPATH; goget only works with first one")
 	}
 
-	gitCmd, err := buildGitCommand(config)
+	gitCmd, err := buildGitCommand(config, useHTTPS)
 	if err != nil {
 		return err
 	}
@@ -248,7 +259,7 @@ func main() {
 		log.Fatalf("could not determine working directory: %v", err)
 	}
 
-	if err := runGoGet(ctx, arg, gopath, workingDir); err != nil {
+	if err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag); err != nil {
 		log.Fatal(err)
 	}
 }
