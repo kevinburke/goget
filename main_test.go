@@ -1,10 +1,23 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// mockHTTPClient is a mock implementation of HTTPClient for testing
+type mockHTTPClient struct {
+	response *http.Response
+	err      error
+}
+
+func (m *mockHTTPClient) Get(url string) (*http.Response, error) {
+	return m.response, m.err
+}
 
 func TestGetRepositoryURL(t *testing.T) {
 	tests := []struct {
@@ -62,18 +75,6 @@ func TestGetRepositoryURL(t *testing.T) {
 			expected:   "https://github.com/user/repo.git",
 		},
 		{
-			name:       "other domain with two parts (SSH)",
-			importPath: "example.com/foo/bar",
-			useHTTPS:   false,
-			expected:   "git@example.com:foo/bar.git",
-		},
-		{
-			name:       "other domain with two parts (HTTPS)",
-			importPath: "example.com/foo/bar",
-			useHTTPS:   true,
-			expected:   "https://example.com/foo/bar.git",
-		},
-		{
 			name:       "github with deep subpackage (SSH)",
 			importPath: "github.com/user/repo/pkg/subpkg",
 			useHTTPS:   false,
@@ -113,7 +114,11 @@ func TestGetRepositoryURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getRepositoryURL(tt.importPath, tt.useHTTPS)
+			// Use a mock client that always fails to ensure no live HTTP calls
+			mockClient := &mockHTTPClient{
+				err: io.EOF,
+			}
+			result := getRepositoryURLWithClient(tt.importPath, tt.useHTTPS, mockClient)
 			if result != tt.expected {
 				t.Errorf("getRepositoryURL(%q, %v) = %q, want %q", tt.importPath, tt.useHTTPS, result, tt.expected)
 			}
@@ -313,7 +318,7 @@ func TestBuildGitCommand(t *testing.T) {
 				t.Errorf("TargetPath = %q, want %q", cmd.TargetPath, tt.expectedPath)
 			}
 
-			expectedArgs := []string{"clone", tt.expectedURL, tt.expectedPath}
+			expectedArgs := []string{"clone", "--quiet", tt.expectedURL, tt.expectedPath}
 			if len(cmd.Args) != len(expectedArgs) {
 				t.Errorf("Args length = %d, want %d", len(cmd.Args), len(expectedArgs))
 				return
@@ -567,4 +572,225 @@ func TestParseGoImportMeta(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDiscoverGoImport(t *testing.T) {
+	tests := []struct {
+		name           string
+		importPath     string
+		responseBody   string
+		responseStatus int
+		responseError  error
+		expectedVCS    string
+		expectedURL    string
+		expectError    bool
+	}{
+		{
+			name:       "successful discovery",
+			importPath: "example.com/pkg",
+			responseBody: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/pkg">
+</head>
+</html>`,
+			responseStatus: http.StatusOK,
+			expectedVCS:    "git",
+			expectedURL:    "https://github.com/example/pkg",
+		},
+		{
+			name:       "discovery with subpackage",
+			importPath: "example.com/pkg/subpkg",
+			responseBody: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/pkg">
+</head>
+</html>`,
+			responseStatus: http.StatusOK,
+			expectedVCS:    "git",
+			expectedURL:    "https://github.com/example/pkg",
+		},
+		{
+			name:           "HTTP 404 error",
+			importPath:     "example.com/pkg",
+			responseBody:   "Not Found",
+			responseStatus: http.StatusNotFound,
+			expectError:    true,
+		},
+		{
+			name:          "network error",
+			importPath:    "example.com/pkg",
+			responseError: io.EOF,
+			expectError:   true,
+		},
+		{
+			name:       "no meta tag found",
+			importPath: "example.com/pkg",
+			responseBody: `<!DOCTYPE html>
+<html>
+<head>
+	<title>No meta tag here</title>
+</head>
+</html>`,
+			responseStatus: http.StatusOK,
+			expectError:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var client HTTPClient
+
+			if tt.responseError != nil {
+				// Mock a network error
+				client = &mockHTTPClient{
+					err: tt.responseError,
+				}
+			} else {
+				// Mock a successful response
+				client = &mockHTTPClient{
+					response: &http.Response{
+						StatusCode: tt.responseStatus,
+						Body:       io.NopCloser(strings.NewReader(tt.responseBody)),
+					},
+				}
+			}
+
+			vcs, url, err := discoverGoImport(tt.importPath, client)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			if vcs != tt.expectedVCS {
+				t.Errorf("VCS = %q, want %q", vcs, tt.expectedVCS)
+			}
+
+			if url != tt.expectedURL {
+				t.Errorf("URL = %q, want %q", url, tt.expectedURL)
+			}
+		})
+	}
+}
+
+func TestGetRepositoryURLWithClient(t *testing.T) {
+	tests := []struct {
+		name           string
+		importPath     string
+		useHTTPS       bool
+		mockResponse   string
+		mockStatus     int
+		expectedURL    string
+	}{
+		{
+			name:       "custom domain with successful discovery",
+			importPath: "example.com/pkg",
+			useHTTPS:   false,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/customrepo">
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "https://github.com/example/customrepo",
+		},
+		{
+			name:       "custom domain with failed discovery falls back to heuristics (SSH)",
+			importPath: "example.com/user/repo",
+			useHTTPS:   false,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<title>No meta tag</title>
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "git@example.com:user/repo.git",
+		},
+		{
+			name:       "custom domain with failed discovery falls back to heuristics (HTTPS)",
+			importPath: "example.com/user/repo",
+			useHTTPS:   true,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<title>No meta tag</title>
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "https://example.com/user/repo.git",
+		},
+		{
+			name:        "github.com doesn't use discovery (SSH)",
+			importPath:  "github.com/user/repo",
+			useHTTPS:    false,
+			expectedURL: "git@github.com:user/repo.git",
+		},
+		{
+			name:        "github.com doesn't use discovery (HTTPS)",
+			importPath:  "github.com/user/repo",
+			useHTTPS:    true,
+			expectedURL: "https://github.com/user/repo.git",
+		},
+		{
+			name:        "golang.org/x doesn't use discovery",
+			importPath:  "golang.org/x/sync",
+			useHTTPS:    false,
+			expectedURL: "https://go.googlesource.com/sync",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var client HTTPClient
+			if tt.mockResponse != "" {
+				client = &mockHTTPClient{
+					response: &http.Response{
+						StatusCode: tt.mockStatus,
+						Body:       io.NopCloser(strings.NewReader(tt.mockResponse)),
+					},
+				}
+			}
+
+			result := getRepositoryURLWithClient(tt.importPath, tt.useHTTPS, client)
+			if result != tt.expectedURL {
+				t.Errorf("getRepositoryURLWithClient(%q, %v) = %q, want %q", tt.importPath, tt.useHTTPS, result, tt.expectedURL)
+			}
+		})
+	}
+}
+
+func TestDiscoverGoImportWithHTTPTest(t *testing.T) {
+	// Test using httptest.Server for more realistic HTTP testing
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the URL query parameter
+		if r.URL.Query().Get("go-get") != "1" {
+			t.Errorf("expected go-get=1 query parameter, got %v", r.URL.RawQuery)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/pkg">
+</head>
+</html>`))
+	}))
+	defer server.Close()
+
+	// For this test, we would need to modify the discoverGoImport function
+	// to accept a base URL parameter, or we can test the integration differently.
+	// Since we're using a mock client, the httptest approach is less necessary.
+	// This test demonstrates the pattern if we wanted to use httptest in the future.
+	t.Skip("This test is for demonstration - we're using mock clients instead")
 }

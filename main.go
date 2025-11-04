@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -11,12 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
+	"golang.org/x/sync/errgroup"
 )
 
 var httpsFlag = flag.Bool("https", false, "use HTTPS for git clones instead of SSH")
+var modFlag = flag.String("mod", "", "path to go.mod file to fetch all direct dependencies")
 
 // Config holds the configuration for a goget operation
 type Config struct {
@@ -33,13 +37,20 @@ type GitCommand struct {
 	Args       []string
 }
 
+// HTTPClient is an interface for making HTTP requests (for testing)
+type HTTPClient interface {
+	Get(url string) (*http.Response, error)
+}
+
 // discoverGoImport fetches the go-import meta tag from a custom domain
-func discoverGoImport(importPath string) (vcs, repoURL string, err error) {
+func discoverGoImport(importPath string, client HTTPClient) (vcs, repoURL string, err error) {
 	// Try HTTPS first
 	url := fmt.Sprintf("https://%s?go-get=1", importPath)
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	if client == nil {
+		client = &http.Client{
+			Timeout: 10 * time.Second,
+		}
 	}
 
 	resp, err := client.Get(url)
@@ -122,14 +133,32 @@ func shouldUseDiscovery(importPath string) bool {
 		return false
 	}
 
+	// Skip discovery for well-known Go-specific domains that have special handling
+	wellKnownGoDomains := []string{
+		"golang.org",
+		"google.golang.org",
+		"go.opentelemetry.io",
+	}
+
+	for _, knownDomain := range wellKnownGoDomains {
+		if domain == knownDomain || strings.HasPrefix(importPath, knownDomain+"/") {
+			return false
+		}
+	}
+
 	return true
 }
 
 // getRepositoryURL handles special cases and converts import paths to git URLs
 func getRepositoryURL(importPath string, useHTTPS bool) string {
+	return getRepositoryURLWithClient(importPath, useHTTPS, nil)
+}
+
+// getRepositoryURLWithClient is like getRepositoryURL but accepts an HTTPClient for testing
+func getRepositoryURLWithClient(importPath string, useHTTPS bool, client HTTPClient) string {
 	// For custom domains (not github.com, gitlab.com, etc.), try HTTP discovery first
 	if shouldUseDiscovery(importPath) {
-		if vcs, repoURL, err := discoverGoImport(importPath); err == nil {
+		if vcs, repoURL, err := discoverGoImport(importPath, client); err == nil {
 			// We only support git for now
 			if vcs == "git" {
 				return repoURL
@@ -319,23 +348,148 @@ func buildGitCommand(config *Config, useHTTPS bool) (*GitCommand, error) {
 	return &GitCommand{
 		URL:        gitURL,
 		TargetPath: checkoutPath,
-		Args:       []string{"clone", gitURL, checkoutPath},
+		Args:       []string{"clone", "--quiet", gitURL, checkoutPath},
 	}, nil
 }
 
 // executeGitCommand runs the git command
-func executeGitCommand(ctx context.Context, cmd *GitCommand) error {
+// Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
+func executeGitCommand(ctx context.Context, cmd *GitCommand) (skipped bool, err error) {
+	// Check if a go.mod file exists at the target path
+	// This handles monorepos where the .git is at a parent level
+	modFile := filepath.Join(cmd.TargetPath, "go.mod")
+	if _, err := os.Stat(modFile); err == nil {
+		fmt.Printf("Package already exists at %s (go.mod found), skipping clone\n", cmd.TargetPath)
+		return true, nil
+	}
+
+	// Also check for .git directory at the exact target path (for non-module repos)
+	gitDir := filepath.Join(cmd.TargetPath, ".git")
+	if _, err := os.Stat(gitDir); err == nil {
+		fmt.Printf("Repository already exists at %s, skipping clone\n", cmd.TargetPath)
+		return true, nil
+	}
+
 	gitCmd := exec.CommandContext(ctx, "git", cmd.Args...)
 	gitCmd.Stdout = os.Stdout
 	gitCmd.Stderr = os.Stderr
-	return gitCmd.Run()
+	return false, gitCmd.Run()
+}
+
+// parseGoMod parses a go.mod file and returns all dependencies (both direct and indirect)
+func parseGoMod(modPath string) ([]string, error) {
+	file, err := os.Open(modPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open go.mod file: %w", err)
+	}
+	defer file.Close()
+
+	var deps []string
+	scanner := bufio.NewScanner(file)
+	inRequireBlock := false
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Check if we're entering a require block
+		if strings.HasPrefix(line, "require (") {
+			inRequireBlock = true
+			continue
+		}
+
+		// Check if we're leaving a require block
+		if inRequireBlock && strings.HasPrefix(line, ")") {
+			inRequireBlock = false
+			continue
+		}
+
+		// Parse require lines (both single-line and multi-line formats)
+		var depLine string
+		if inRequireBlock {
+			depLine = line
+		} else if strings.HasPrefix(line, "require ") {
+			depLine = strings.TrimPrefix(line, "require ")
+		}
+
+		if depLine == "" {
+			continue
+		}
+
+		// Extract the package path (first field before version)
+		fields := strings.Fields(depLine)
+		if len(fields) >= 2 {
+			deps = append(deps, fields[0])
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading go.mod file: %w", err)
+	}
+
+	return deps, nil
+}
+
+// DependencyResult holds the result of fetching a single dependency
+type DependencyResult struct {
+	ImportPath string
+	Error      error
+	Skipped    bool
+}
+
+// runGoGetParallel fetches multiple dependencies in parallel
+func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir string, useHTTPS bool) []DependencyResult {
+	results := make([]DependencyResult, len(deps))
+
+	// Use a mutex to ensure git output doesn't get interleaved
+	var outputMutex sync.Mutex
+
+	// Use errgroup with concurrency limit to avoid spawning too many goroutines
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(10) // Limit to 10 concurrent git clones
+
+	for i, dep := range deps {
+		idx := i
+		importPath := dep
+		g.Go(func() error {
+			// Lock output to prevent interleaving
+			outputMutex.Lock()
+			fmt.Printf("\n[%d/%d] Fetching %s...\n", idx+1, len(deps), importPath)
+			outputMutex.Unlock()
+
+			skipped, err := runGoGet(ctx, importPath, gopath, workingDir, useHTTPS)
+			results[idx] = DependencyResult{
+				ImportPath: importPath,
+				Error:      err,
+				Skipped:    skipped,
+			}
+
+			outputMutex.Lock()
+			if err != nil {
+				fmt.Printf("[%d/%d] ERROR: Failed to fetch %s: %v\n", idx+1, len(deps), importPath, err)
+			} else if skipped {
+				fmt.Printf("[%d/%d] SKIPPED: %s\n", idx+1, len(deps), importPath)
+			} else {
+				fmt.Printf("[%d/%d] SUCCESS: Fetched %s\n", idx+1, len(deps), importPath)
+			}
+			outputMutex.Unlock()
+
+			// Don't return error - we want to continue fetching all deps
+			return nil
+		})
+	}
+
+	// Wait for all goroutines to complete
+	_ = g.Wait() // We ignore this error since we collect errors in results
+
+	return results
 }
 
 // runGoGet is the main logic, extracted from main() for testability
-func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool) error {
+// Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
+func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool) (skipped bool, err error) {
 	config, err := resolveConfig(arg, gopath, workingDir)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if config.HasEllipsis {
@@ -348,20 +502,21 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool
 
 	gitCmd, err := buildGitCommand(config, useHTTPS)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	fmt.Printf("git %s\n", strings.Join(gitCmd.Args, " "))
 
-	if err := executeGitCommand(ctx, gitCmd); err != nil {
-		return fmt.Errorf("error running git %v: %v", strings.Join(gitCmd.Args, " "), err)
+	skipped, err = executeGitCommand(ctx, gitCmd)
+	if err != nil {
+		return false, fmt.Errorf("error running git %v: %v", strings.Join(gitCmd.Args, " "), err)
 	}
 
-	if config.HasEllipsis {
+	if config.HasEllipsis && !skipped {
 		fmt.Printf("Successfully cloned %s (note: /... means this package and all subpackages)\n", config.ImportPath)
 	}
 
-	return nil
+	return skipped, nil
 }
 
 func main() {
@@ -369,10 +524,6 @@ func main() {
 	defer cancel()
 
 	flag.Parse()
-	arg := flag.Arg(0)
-	if arg == "" {
-		log.Fatal("usage: goget <path>")
-	}
 
 	gopath := os.Getenv("GOPATH")
 	workingDir, err := os.Getwd()
@@ -380,7 +531,59 @@ func main() {
 		log.Fatalf("could not determine working directory: %v", err)
 	}
 
-	if err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag); err != nil {
+	// Handle --mod flag
+	if *modFlag != "" {
+		fmt.Printf("Parsing dependencies from %s...\n", *modFlag)
+		deps, err := parseGoMod(*modFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if len(deps) == 0 {
+			fmt.Println("No dependencies found in go.mod")
+			return
+		}
+
+		fmt.Printf("Found %d dependencies (direct and indirect)\n", len(deps))
+		results := runGoGetParallel(ctx, deps, gopath, workingDir, *httpsFlag)
+
+		// Print summary
+		fmt.Println("\n" + strings.Repeat("=", 60))
+		fmt.Println("SUMMARY")
+		fmt.Println(strings.Repeat("=", 60))
+
+		successCount := 0
+		failureCount := 0
+		for _, result := range results {
+			if result.Error == nil {
+				successCount++
+			} else {
+				failureCount++
+			}
+		}
+
+		fmt.Printf("Total: %d | Success: %d | Failed: %d\n", len(results), successCount, failureCount)
+
+		if failureCount > 0 {
+			fmt.Println("\nFailed dependencies:")
+			for _, result := range results {
+				if result.Error != nil {
+					fmt.Printf("  - %s: %v\n", result.ImportPath, result.Error)
+				}
+			}
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	// Original single-package behavior
+	arg := flag.Arg(0)
+	if arg == "" {
+		log.Fatal("usage: goget <path> or goget --mod <path/to/go.mod>")
+	}
+
+	if _, err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag); err != nil {
 		log.Fatal(err)
 	}
 }
