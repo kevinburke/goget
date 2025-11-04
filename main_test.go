@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -396,6 +397,173 @@ func TestResolveConfig(t *testing.T) {
 			// Check that GOPATH was made absolute
 			if !filepath.IsAbs(config.GOPATH) {
 				t.Errorf("GOPATH should be absolute, got %q", config.GOPATH)
+			}
+		})
+	}
+}
+
+func TestShouldUseDiscovery(t *testing.T) {
+	tests := []struct {
+		name       string
+		importPath string
+		expected   bool
+	}{
+		{
+			name:       "github.com should not use discovery",
+			importPath: "github.com/user/repo",
+			expected:   false,
+		},
+		{
+			name:       "gitlab.com should not use discovery",
+			importPath: "gitlab.com/user/repo",
+			expected:   false,
+		},
+		{
+			name:       "bitbucket.org should not use discovery",
+			importPath: "bitbucket.org/user/repo",
+			expected:   false,
+		},
+		{
+			name:       "golang.org/x should not use discovery",
+			importPath: "golang.org/x/sync",
+			expected:   false,
+		},
+		{
+			name:       "google.golang.org should not use discovery",
+			importPath: "google.golang.org/protobuf",
+			expected:   false,
+		},
+		{
+			name:       "go.opentelemetry.io should not use discovery",
+			importPath: "go.opentelemetry.io/otel",
+			expected:   false,
+		},
+		{
+			name:       "custom domain should use discovery",
+			importPath: "example.com/user/repo",
+			expected:   true,
+		},
+		{
+			name:       "another custom domain should use discovery",
+			importPath: "mycompany.dev/internal/tools",
+			expected:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := shouldUseDiscovery(tt.importPath)
+			if result != tt.expected {
+				t.Errorf("shouldUseDiscovery(%q) = %v, want %v", tt.importPath, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseGoImportMeta(t *testing.T) {
+	tests := []struct {
+		name        string
+		html        string
+		importPath  string
+		expectedVCS string
+		expectedURL string
+		expectError bool
+	}{
+		{
+			name: "valid go-import meta tag",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="google.golang.org/protobuf git https://github.com/protocolbuffers/protobuf-go">
+</head>
+</html>`,
+			importPath:  "google.golang.org/protobuf",
+			expectedVCS: "git",
+			expectedURL: "https://github.com/protocolbuffers/protobuf-go",
+		},
+		{
+			name: "meta tag with subpackage",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/pkg">
+</head>
+</html>`,
+			importPath:  "example.com/pkg/subpkg",
+			expectedVCS: "git",
+			expectedURL: "https://github.com/example/pkg",
+		},
+		{
+			name: "multiple meta tags, only one is go-import",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="description" content="A Go package">
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/pkg">
+	<meta name="keywords" content="go, golang">
+</head>
+</html>`,
+			importPath:  "example.com/pkg",
+			expectedVCS: "git",
+			expectedURL: "https://github.com/example/pkg",
+		},
+		{
+			name: "no go-import meta tag",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="description" content="A Go package">
+</head>
+</html>`,
+			importPath:  "example.com/pkg",
+			expectError: true,
+		},
+		{
+			name: "malformed content (only 2 parts)",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git">
+</head>
+</html>`,
+			importPath:  "example.com/pkg",
+			expectError: true,
+		},
+		{
+			name: "prefix mismatch",
+			html: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="other.com/pkg git https://github.com/other/pkg">
+</head>
+</html>`,
+			importPath:  "example.com/pkg",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vcs, url, err := parseGoImportMeta(strings.NewReader(tt.html), tt.importPath)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			if vcs != tt.expectedVCS {
+				t.Errorf("VCS = %q, want %q", vcs, tt.expectedVCS)
+			}
+
+			if url != tt.expectedURL {
+				t.Errorf("URL = %q, want %q", url, tt.expectedURL)
 			}
 		})
 	}

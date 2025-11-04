@@ -4,11 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"golang.org/x/net/html"
 )
 
 var httpsFlag = flag.Bool("https", false, "use HTTPS for git clones instead of SSH")
@@ -28,11 +33,115 @@ type GitCommand struct {
 	Args       []string
 }
 
+// discoverGoImport fetches the go-import meta tag from a custom domain
+func discoverGoImport(importPath string) (vcs, repoURL string, err error) {
+	// Try HTTPS first
+	url := fmt.Sprintf("https://%s?go-get=1", importPath)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to fetch %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("got status %d from %s", resp.StatusCode, url)
+	}
+
+	return parseGoImportMeta(resp.Body, importPath)
+}
+
+// parseGoImportMeta extracts the go-import meta tag from HTML
+func parseGoImportMeta(r io.Reader, importPath string) (vcs, repoURL string, err error) {
+	tokenizer := html.NewTokenizer(r)
+
+	for {
+		tokenType := tokenizer.Next()
+
+		switch tokenType {
+		case html.ErrorToken:
+			err := tokenizer.Err()
+			if err == io.EOF {
+				return "", "", fmt.Errorf("no go-import meta tag found")
+			}
+			return "", "", err
+
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			if token.Data != "meta" {
+				continue
+			}
+
+			var name, content string
+			for _, attr := range token.Attr {
+				if attr.Key == "name" {
+					name = attr.Val
+				}
+				if attr.Key == "content" {
+					content = attr.Val
+				}
+			}
+
+			if name != "go-import" {
+				continue
+			}
+
+			// Parse content: "prefix vcs repo-url"
+			parts := strings.Fields(content)
+			if len(parts) != 3 {
+				continue
+			}
+
+			prefix, vcsType, repoURL := parts[0], parts[1], parts[2]
+
+			// Check if the prefix matches our import path
+			if !strings.HasPrefix(importPath, prefix) {
+				continue
+			}
+
+			return vcsType, repoURL, nil
+		}
+	}
+}
+
+// shouldUseDiscovery determines if we should try HTTP discovery for this import path
+func shouldUseDiscovery(importPath string) bool {
+	parts := strings.Split(importPath, "/")
+	if len(parts) == 0 {
+		return false
+	}
+
+	domain := parts[0]
+
+	// Skip discovery for well-known Git hosts - we already know their patterns
+	if isCommonGitHost(domain) {
+		return false
+	}
+
+	return true
+}
+
 // getRepositoryURL handles special cases and converts import paths to git URLs
 func getRepositoryURL(importPath string, useHTTPS bool) string {
+	// For custom domains (not github.com, gitlab.com, etc.), try HTTP discovery first
+	if shouldUseDiscovery(importPath) {
+		if vcs, repoURL, err := discoverGoImport(importPath); err == nil {
+			// We only support git for now
+			if vcs == "git" {
+				return repoURL
+			}
+			log.Printf("WARN: discovered VCS type %q is not supported, falling back to heuristics", vcs)
+		} else {
+			log.Printf("WARN: failed to discover go-import meta tag: %v, falling back to heuristics", err)
+		}
+	}
+
 	// Handle golang.org/x/* packages
-	if strings.HasPrefix(importPath, "golang.org/x/") {
-		repo := strings.TrimPrefix(importPath, "golang.org/x/")
+	if repo, ok := strings.CutPrefix(importPath, "golang.org/x/"); ok {
 		// Remove any subpackage paths - just get the main repo name
 		if idx := strings.Index(repo, "/"); idx != -1 {
 			repo = repo[:idx]
@@ -40,11 +149,23 @@ func getRepositoryURL(importPath string, useHTTPS bool) string {
 		return fmt.Sprintf("https://go.googlesource.com/%s", repo)
 	}
 
-	// Handle other special cases as needed
-	// You can add more special cases here, for example:
-	// if strings.HasPrefix(importPath, "go.uber.org/") {
-	//     // Handle uber's vanity URLs
-	// }
+	// Handle google.golang.org/* packages
+	if repo, ok := strings.CutPrefix(importPath, "google.golang.org/"); ok {
+		// Remove any subpackage paths - just get the main repo name
+		if idx := strings.Index(repo, "/"); idx != -1 {
+			repo = repo[:idx]
+		}
+		return fmt.Sprintf("https://github.com/googleapis/%s", repo)
+	}
+
+	// Handle go.opentelemetry.io/* packages
+	if repo, ok := strings.CutPrefix(importPath, "go.opentelemetry.io/"); ok {
+		// Remove any subpackage paths - just get the main repo name
+		if idx := strings.Index(repo, "/"); idx != -1 {
+			repo = repo[:idx]
+		}
+		return fmt.Sprintf("https://github.com/open-telemetry/%s", repo)
+	}
 
 	// Default behavior: construct SSH or HTTPS URL from import path
 	parts := strings.Split(importPath, "/")
