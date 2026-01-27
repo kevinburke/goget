@@ -684,12 +684,12 @@ func TestDiscoverGoImport(t *testing.T) {
 
 func TestGetRepositoryURLWithClient(t *testing.T) {
 	tests := []struct {
-		name           string
-		importPath     string
-		useHTTPS       bool
-		mockResponse   string
-		mockStatus     int
-		expectedURL    string
+		name         string
+		importPath   string
+		useHTTPS     bool
+		mockResponse string
+		mockStatus   int
+		expectedURL  string
 	}{
 		{
 			name:       "custom domain with successful discovery",

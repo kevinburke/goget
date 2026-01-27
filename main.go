@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 
 var httpsFlag = flag.Bool("https", false, "use HTTPS for git clones instead of SSH")
 var modFlag = flag.String("mod", "", "path to go.mod file to fetch all direct dependencies")
+var acceptSSHHostFlag = flag.Bool("accept-ssh-host", false, "automatically accept new SSH host keys (use with caution)")
 
 // Config holds the configuration for a goget operation
 type Config struct {
@@ -354,7 +356,7 @@ func buildGitCommand(config *Config, useHTTPS bool) (*GitCommand, error) {
 
 // executeGitCommand runs the git command
 // Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
-func executeGitCommand(ctx context.Context, cmd *GitCommand) (skipped bool, err error) {
+func executeGitCommand(ctx context.Context, cmd *GitCommand, acceptSSHHost bool) (skipped bool, err error) {
 	// Check if a go.mod file exists at the target path
 	// This handles monorepos where the .git is at a parent level
 	modFile := filepath.Join(cmd.TargetPath, "go.mod")
@@ -372,8 +374,52 @@ func executeGitCommand(ctx context.Context, cmd *GitCommand) (skipped bool, err 
 
 	gitCmd := exec.CommandContext(ctx, "git", cmd.Args...)
 	gitCmd.Stdout = os.Stdout
-	gitCmd.Stderr = os.Stderr
-	return false, gitCmd.Run()
+
+	// Configure SSH to fail fast instead of hanging on prompts
+	if strings.HasPrefix(cmd.URL, "git@") {
+		sshOpts := "ssh -o BatchMode=yes"
+		if acceptSSHHost {
+			// Accept new host keys automatically (but still reject changed keys)
+			sshOpts = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+		}
+		gitCmd.Env = append(os.Environ(), "GIT_SSH_COMMAND="+sshOpts)
+	}
+
+	// Capture stderr to detect SSH host key errors
+	var stderrBuf bytes.Buffer
+	gitCmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+
+	runErr := gitCmd.Run()
+	if runErr != nil {
+		stderr := stderrBuf.String()
+		// Check for SSH host key verification failure
+		if strings.Contains(stderr, "Host key verification failed") ||
+			strings.Contains(stderr, "host key") {
+			// Extract the hostname from the git URL for the hint
+			host := extractHostFromGitURL(cmd.URL)
+			hint := fmt.Sprintf("\nSSH host key verification failed for %s.\n", host)
+			hint += "To fix this, you can:\n"
+			hint += fmt.Sprintf("  1. Add the host to known_hosts: ssh-keyscan %s >> ~/.ssh/known_hosts\n", host)
+			hint += "  2. Connect manually once: ssh -T git@" + host + "\n"
+			hint += "  3. Use --accept-ssh-host flag to auto-accept new host keys\n"
+			hint += "  4. Use --https flag to clone via HTTPS instead\n"
+			return false, fmt.Errorf("%w%s", runErr, hint)
+		}
+	}
+
+	return false, runErr
+}
+
+// extractHostFromGitURL extracts the hostname from a git URL like git@github.com:user/repo.git
+func extractHostFromGitURL(url string) string {
+	if strings.HasPrefix(url, "git@") {
+		// Format: git@hostname:path
+		url = strings.TrimPrefix(url, "git@")
+		if idx := strings.Index(url, ":"); idx != -1 {
+			return url[:idx]
+		}
+	}
+	return url
 }
 
 // parseGoMod parses a go.mod file and returns all dependencies (both direct and indirect)
@@ -437,7 +483,7 @@ type DependencyResult struct {
 }
 
 // runGoGetParallel fetches multiple dependencies in parallel
-func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir string, useHTTPS bool) []DependencyResult {
+func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir string, useHTTPS, acceptSSHHost bool) []DependencyResult {
 	results := make([]DependencyResult, len(deps))
 
 	// Use a mutex to ensure git output doesn't get interleaved
@@ -456,7 +502,7 @@ func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir str
 			fmt.Printf("\n[%d/%d] Fetching %s...\n", idx+1, len(deps), importPath)
 			outputMutex.Unlock()
 
-			skipped, err := runGoGet(ctx, importPath, gopath, workingDir, useHTTPS)
+			skipped, err := runGoGet(ctx, importPath, gopath, workingDir, useHTTPS, acceptSSHHost)
 			results[idx] = DependencyResult{
 				ImportPath: importPath,
 				Error:      err,
@@ -486,7 +532,7 @@ func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir str
 
 // runGoGet is the main logic, extracted from main() for testability
 // Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
-func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool) (skipped bool, err error) {
+func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acceptSSHHost bool) (skipped bool, err error) {
 	config, err := resolveConfig(arg, gopath, workingDir)
 	if err != nil {
 		return false, err
@@ -507,7 +553,7 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS bool
 
 	fmt.Printf("git %s\n", strings.Join(gitCmd.Args, " "))
 
-	skipped, err = executeGitCommand(ctx, gitCmd)
+	skipped, err = executeGitCommand(ctx, gitCmd, acceptSSHHost)
 	if err != nil {
 		return false, fmt.Errorf("error running git %v: %v", strings.Join(gitCmd.Args, " "), err)
 	}
@@ -545,7 +591,7 @@ func main() {
 		}
 
 		fmt.Printf("Found %d dependencies (direct and indirect)\n", len(deps))
-		results := runGoGetParallel(ctx, deps, gopath, workingDir, *httpsFlag)
+		results := runGoGetParallel(ctx, deps, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag)
 
 		// Print summary
 		fmt.Println("\n" + strings.Repeat("=", 60))
@@ -583,7 +629,7 @@ func main() {
 		log.Fatal("usage: goget <path> or goget --mod <path/to/go.mod>")
 	}
 
-	if _, err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag); err != nil {
+	if _, err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag); err != nil {
 		log.Fatal(err)
 	}
 }
