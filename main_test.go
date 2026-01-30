@@ -692,9 +692,22 @@ func TestGetRepositoryURLWithClient(t *testing.T) {
 		expectedURL  string
 	}{
 		{
-			name:       "custom domain with successful discovery",
+			name:       "custom domain with successful discovery (converts HTTPS to SSH)",
 			importPath: "example.com/pkg",
 			useHTTPS:   false,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/pkg git https://github.com/example/customrepo">
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "git@github.com:example/customrepo.git",
+		},
+		{
+			name:       "custom domain with successful discovery (HTTPS flag preserves HTTPS)",
+			importPath: "example.com/pkg",
+			useHTTPS:   true,
 			mockResponse: `<!DOCTYPE html>
 <html>
 <head>
@@ -760,6 +773,133 @@ func TestGetRepositoryURLWithClient(t *testing.T) {
 						Body:       io.NopCloser(strings.NewReader(tt.mockResponse)),
 					},
 				}
+			}
+
+			result := getRepositoryURLWithClient(tt.importPath, tt.useHTTPS, client)
+			if result != tt.expectedURL {
+				t.Errorf("getRepositoryURLWithClient(%q, %v) = %q, want %q", tt.importPath, tt.useHTTPS, result, tt.expectedURL)
+			}
+		})
+	}
+}
+
+func TestHttpsToSSH(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "github HTTPS to SSH",
+			input:    "https://github.com/user/repo.git",
+			expected: "git@github.com:user/repo.git",
+		},
+		{
+			name:     "github HTTPS without .git suffix",
+			input:    "https://github.com/user/repo",
+			expected: "git@github.com:user/repo.git",
+		},
+		{
+			name:     "gitlab HTTPS to SSH",
+			input:    "https://gitlab.com/user/repo.git",
+			expected: "git@gitlab.com:user/repo.git",
+		},
+		{
+			name:     "github enterprise HTTPS to SSH",
+			input:    "https://github.mycompany.com/org/repo.git",
+			expected: "git@github.mycompany.com:org/repo.git",
+		},
+		{
+			name:     "already SSH URL unchanged",
+			input:    "git@github.com:user/repo.git",
+			expected: "git@github.com:user/repo.git",
+		},
+		{
+			name:     "HTTP URL unchanged (not HTTPS)",
+			input:    "http://github.com/user/repo.git",
+			expected: "http://github.com/user/repo.git",
+		},
+		{
+			name:     "URL with no path unchanged",
+			input:    "https://github.com",
+			expected: "https://github.com",
+		},
+		{
+			name:     "deep path",
+			input:    "https://example.com/org/suborg/repo.git",
+			expected: "git@example.com:org/suborg/repo.git",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := httpsToSSH(tt.input)
+			if result != tt.expected {
+				t.Errorf("httpsToSSH(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetRepositoryURLWithDiscoveryConvertsHTTPSToSSH(t *testing.T) {
+	// Test that when discovery returns an HTTPS URL and useHTTPS=false,
+	// the URL is converted to SSH format
+	tests := []struct {
+		name         string
+		importPath   string
+		useHTTPS     bool
+		mockResponse string
+		mockStatus   int
+		expectedURL  string
+	}{
+		{
+			name:       "discovery returns HTTPS, useHTTPS=false converts to SSH",
+			importPath: "example.com/org/repo",
+			useHTTPS:   false,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/org/repo git https://github.enterprise.com/org/repo">
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "git@github.enterprise.com:org/repo.git",
+		},
+		{
+			name:       "discovery returns HTTPS, useHTTPS=true keeps HTTPS",
+			importPath: "example.com/org/repo",
+			useHTTPS:   true,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/org/repo git https://github.enterprise.com/org/repo">
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "https://github.enterprise.com/org/repo",
+		},
+		{
+			name:       "discovery returns SSH URL, useHTTPS=false keeps SSH",
+			importPath: "example.com/org/repo",
+			useHTTPS:   false,
+			mockResponse: `<!DOCTYPE html>
+<html>
+<head>
+	<meta name="go-import" content="example.com/org/repo git git@github.enterprise.com:org/repo.git">
+</head>
+</html>`,
+			mockStatus:  http.StatusOK,
+			expectedURL: "git@github.enterprise.com:org/repo.git",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockHTTPClient{
+				response: &http.Response{
+					StatusCode: tt.mockStatus,
+					Body:       io.NopCloser(strings.NewReader(tt.mockResponse)),
+				},
 			}
 
 			result := getRepositoryURLWithClient(tt.importPath, tt.useHTTPS, client)

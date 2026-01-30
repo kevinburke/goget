@@ -163,6 +163,12 @@ func getRepositoryURLWithClient(importPath string, useHTTPS bool, client HTTPCli
 		if vcs, repoURL, err := discoverGoImport(importPath, client); err == nil {
 			// We only support git for now
 			if vcs == "git" {
+				// If the user prefers SSH and the discovered URL is HTTPS,
+				// convert it to SSH. The caller will handle fallback to HTTPS
+				// if SSH fails.
+				if !useHTTPS && strings.HasPrefix(repoURL, "https://") {
+					return httpsToSSH(repoURL)
+				}
 				return repoURL
 			}
 			log.Printf("WARN: discovered VCS type %q is not supported, falling back to heuristics", vcs)
@@ -422,6 +428,34 @@ func extractHostFromGitURL(url string) string {
 	return url
 }
 
+// httpsToSSH converts an HTTPS git URL to an SSH git URL.
+// For example: https://github.com/user/repo.git -> git@github.com:user/repo.git
+// Returns the original URL if it's not an HTTPS URL or can't be converted.
+func httpsToSSH(url string) string {
+	if !strings.HasPrefix(url, "https://") {
+		return url
+	}
+
+	// Remove the https:// prefix
+	remainder := strings.TrimPrefix(url, "https://")
+
+	// Split into host and path
+	idx := strings.Index(remainder, "/")
+	if idx == -1 {
+		return url // No path, can't convert
+	}
+
+	host := remainder[:idx]
+	path := remainder[idx+1:]
+
+	// Ensure .git suffix
+	if !strings.HasSuffix(path, ".git") {
+		path = path + ".git"
+	}
+
+	return fmt.Sprintf("git@%s:%s", host, path)
+}
+
 // parseGoMod parses a go.mod file and returns all dependencies (both direct and indirect)
 func parseGoMod(modPath string) ([]string, error) {
 	file, err := os.Open(modPath)
@@ -555,7 +589,19 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acc
 
 	skipped, err = executeGitCommand(ctx, gitCmd, acceptSSHHost)
 	if err != nil {
-		return false, fmt.Errorf("error running git %v: %v", strings.Join(gitCmd.Args, " "), err)
+		// If SSH clone failed and we weren't explicitly using HTTPS,
+		// try falling back to HTTPS
+		if !useHTTPS && strings.HasPrefix(gitCmd.URL, "git@") {
+			log.Printf("SSH clone failed, falling back to HTTPS...")
+			httpsCmd, httpsErr := buildGitCommand(config, true)
+			if httpsErr == nil {
+				fmt.Printf("git %s\n", strings.Join(httpsCmd.Args, " "))
+				skipped, err = executeGitCommand(ctx, httpsCmd, acceptSSHHost)
+			}
+		}
+		if err != nil {
+			return false, fmt.Errorf("error running git %v: %v", strings.Join(gitCmd.Args, " "), err)
+		}
 	}
 
 	if config.HasEllipsis && !skipped {
