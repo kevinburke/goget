@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 var httpsFlag = flag.Bool("https", false, "use HTTPS for git clones instead of SSH")
 var modFlag = flag.String("mod", "", "path to go.mod file to fetch all direct dependencies")
 var acceptSSHHostFlag = flag.Bool("accept-ssh-host", false, "automatically accept new SSH host keys (use with caution)")
+var skipFsckFlag = flag.Bool("skip-fsck", false, "skip fsck checks during clone (allows cloning repos with fsck errors in packed objects)")
 
 // Config holds the configuration for a goget operation
 type Config struct {
@@ -247,12 +249,7 @@ func isCommonGitHost(domain string) bool {
 		"bitbucket.org",
 	}
 
-	for _, host := range commonHosts {
-		if domain == host {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(commonHosts, domain)
 }
 
 // parseImportPath processes the raw argument and extracts the import path and ellipsis flag
@@ -261,8 +258,8 @@ func parseImportPath(arg string) (importPath string, hasEllipsis bool, err error
 		return "", false, fmt.Errorf("empty import path")
 	}
 
-	if strings.HasSuffix(arg, "/...") {
-		return strings.TrimSuffix(arg, "/..."), true, nil
+	if before, ok := strings.CutSuffix(arg, "/..."); ok {
+		return before, true, nil
 	}
 
 	return arg, false, nil
@@ -362,7 +359,7 @@ func buildGitCommand(config *Config, useHTTPS bool) (*GitCommand, error) {
 
 // executeGitCommand runs the git command
 // Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
-func executeGitCommand(ctx context.Context, cmd *GitCommand, acceptSSHHost bool) (skipped bool, err error) {
+func executeGitCommand(ctx context.Context, cmd *GitCommand, acceptSSHHost, skipFsck bool) (skipped bool, err error) {
 	// Check if a go.mod file exists at the target path
 	// This handles monorepos where the .git is at a parent level
 	modFile := filepath.Join(cmd.TargetPath, "go.mod")
@@ -378,7 +375,11 @@ func executeGitCommand(ctx context.Context, cmd *GitCommand, acceptSSHHost bool)
 		return true, nil
 	}
 
-	gitCmd := exec.CommandContext(ctx, "git", cmd.Args...)
+	args := cmd.Args
+	if skipFsck {
+		args = append([]string{"-c", "transfer.fsckObjects=false", "-c", "fetch.fsckObjects=false"}, args...)
+	}
+	gitCmd := exec.CommandContext(ctx, "git", args...)
 	gitCmd.Stdout = os.Stdout
 
 	// Configure SSH to fail fast instead of hanging on prompts
@@ -418,11 +419,11 @@ func executeGitCommand(ctx context.Context, cmd *GitCommand, acceptSSHHost bool)
 
 // extractHostFromGitURL extracts the hostname from a git URL like git@github.com:user/repo.git
 func extractHostFromGitURL(url string) string {
-	if strings.HasPrefix(url, "git@") {
+	if after, ok := strings.CutPrefix(url, "git@"); ok {
 		// Format: git@hostname:path
-		url = strings.TrimPrefix(url, "git@")
-		if idx := strings.Index(url, ":"); idx != -1 {
-			return url[:idx]
+		url = after
+		if before, _, ok := strings.Cut(url, ":"); ok {
+			return before
 		}
 	}
 	return url
@@ -440,13 +441,13 @@ func httpsToSSH(url string) string {
 	remainder := strings.TrimPrefix(url, "https://")
 
 	// Split into host and path
-	idx := strings.Index(remainder, "/")
-	if idx == -1 {
+	before, after, ok := strings.Cut(remainder, "/")
+	if !ok {
 		return url // No path, can't convert
 	}
 
-	host := remainder[:idx]
-	path := remainder[idx+1:]
+	host := before
+	path := after
 
 	// Ensure .git suffix
 	if !strings.HasSuffix(path, ".git") {
@@ -487,8 +488,8 @@ func parseGoMod(modPath string) ([]string, error) {
 		var depLine string
 		if inRequireBlock {
 			depLine = line
-		} else if strings.HasPrefix(line, "require ") {
-			depLine = strings.TrimPrefix(line, "require ")
+		} else if after, ok := strings.CutPrefix(line, "require "); ok {
+			depLine = after
 		}
 
 		if depLine == "" {
@@ -517,7 +518,7 @@ type DependencyResult struct {
 }
 
 // runGoGetParallel fetches multiple dependencies in parallel
-func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir string, useHTTPS, acceptSSHHost bool) []DependencyResult {
+func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir string, useHTTPS, acceptSSHHost, skipFsck bool) []DependencyResult {
 	results := make([]DependencyResult, len(deps))
 
 	// Use a mutex to ensure git output doesn't get interleaved
@@ -536,7 +537,7 @@ func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir str
 			fmt.Printf("\n[%d/%d] Fetching %s...\n", idx+1, len(deps), importPath)
 			outputMutex.Unlock()
 
-			skipped, err := runGoGet(ctx, importPath, gopath, workingDir, useHTTPS, acceptSSHHost)
+			skipped, err := runGoGet(ctx, importPath, gopath, workingDir, useHTTPS, acceptSSHHost, skipFsck)
 			results[idx] = DependencyResult{
 				ImportPath: importPath,
 				Error:      err,
@@ -566,7 +567,7 @@ func runGoGetParallel(ctx context.Context, deps []string, gopath, workingDir str
 
 // runGoGet is the main logic, extracted from main() for testability
 // Returns (skipped=true, nil) if the repo already exists, (skipped=false, nil) if cloned successfully, or (skipped=false, err) on error
-func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acceptSSHHost bool) (skipped bool, err error) {
+func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acceptSSHHost, skipFsck bool) (skipped bool, err error) {
 	config, err := resolveConfig(arg, gopath, workingDir)
 	if err != nil {
 		return false, err
@@ -587,7 +588,7 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acc
 
 	fmt.Printf("git %s\n", strings.Join(gitCmd.Args, " "))
 
-	skipped, err = executeGitCommand(ctx, gitCmd, acceptSSHHost)
+	skipped, err = executeGitCommand(ctx, gitCmd, acceptSSHHost, skipFsck)
 	if err != nil {
 		// If SSH clone failed and we weren't explicitly using HTTPS,
 		// try falling back to HTTPS
@@ -596,7 +597,7 @@ func runGoGet(ctx context.Context, arg, gopath, workingDir string, useHTTPS, acc
 			httpsCmd, httpsErr := buildGitCommand(config, true)
 			if httpsErr == nil {
 				fmt.Printf("git %s\n", strings.Join(httpsCmd.Args, " "))
-				skipped, err = executeGitCommand(ctx, httpsCmd, acceptSSHHost)
+				skipped, err = executeGitCommand(ctx, httpsCmd, acceptSSHHost, skipFsck)
 			}
 		}
 		if err != nil {
@@ -637,7 +638,7 @@ func main() {
 		}
 
 		fmt.Printf("Found %d dependencies (direct and indirect)\n", len(deps))
-		results := runGoGetParallel(ctx, deps, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag)
+		results := runGoGetParallel(ctx, deps, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag, *skipFsckFlag)
 
 		// Print summary
 		fmt.Println("\n" + strings.Repeat("=", 60))
@@ -675,7 +676,7 @@ func main() {
 		log.Fatal("usage: goget <path> or goget --mod <path/to/go.mod>")
 	}
 
-	if _, err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag); err != nil {
+	if _, err := runGoGet(ctx, arg, gopath, workingDir, *httpsFlag, *acceptSSHHostFlag, *skipFsckFlag); err != nil {
 		log.Fatal(err)
 	}
 }
