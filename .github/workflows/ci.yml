@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - go-version: oldstable
+            label: oldstable
+            race: false
+          - go-version: stable
+            label: stable
+            race: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          cache: true
+          check-latest: true
+          go-version: ${{ matrix.go-version }}
+
+      - name: Build
+        run: go build -trimpath ./...
+
+      - name: Test
+        run: go test -trimpath ./...
+
+      - name: Test with race detector
+        if: matrix.race
+        run: go test -trimpath -race ./...
+
+      - name: Vet
+        if: matrix.race
+        run: go vet ./...
+
+  verify-generated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          cache: true
+          check-latest: true
+          go-version: stable
+
+      - name: Install verification tools
+        run: |
+          set -e
+          go install github.com/kevinburke/differ@latest
+          go install golang.org/x/tools/cmd/goimports@latest
+
+      - name: Verify generated files and formatting
+        run: |
+          set -e
+          differ go fix ./...
+          differ go fmt ./...
+          differ go mod tidy
+          differ go generate ./...
+          differ goimports -w .

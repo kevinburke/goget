@@ -911,6 +911,8 @@ func TestGetRepositoryURLWithDiscoveryConvertsHTTPSToSSH(t *testing.T) {
 }
 
 func TestDiscoverGoImportWithHTTPTest(t *testing.T) {
+	t.Skip("This test is for demonstration - we're using mock clients instead")
+
 	// Test using httptest.Server for more realistic HTTP testing
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Verify the URL query parameter
@@ -932,5 +934,4 @@ func TestDiscoverGoImportWithHTTPTest(t *testing.T) {
 	// to accept a base URL parameter, or we can test the integration differently.
 	// Since we're using a mock client, the httptest approach is less necessary.
 	// This test demonstrates the pattern if we wanted to use httptest in the future.
-	t.Skip("This test is for demonstration - we're using mock clients instead")
 }
